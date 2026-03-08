@@ -1,0 +1,62 @@
+name: 'Issue Pilot'
+description: 'AI-powered GitHub Issue triage — automatically label, deduplicate, and route issues'
+author: 'Issue Pilot'
+
+branding:
+  icon: 'zap'
+  color: 'purple'
+
+inputs:
+  openai-api-key:
+    description: 'OpenAI API key for AI-powered triage (required)'
+    required: true
+
+  github-token:
+    description: 'GitHub token for reading and labeling issues'
+    required: true
+    default: ${{ github.token }}
+
+  labels:
+    description: |
+      JSON array of label configurations to use. Each label should have:
+      name, description, and color (hex without #).
+      If not provided, default Issue Pilot labels will be used.
+    required: false
+
+  dry-run:
+    description: 'If true, analyze issues but do not apply labels or post comments'
+    required: false
+    default: 'false'
+
+  duplicate-threshold:
+    description: |
+      Similarity threshold (0–1) for duplicate detection.
+      Issues with similarity above this value are flagged as potential duplicates.
+      Default: 0.85 (85% similar)
+    required: false
+    default: '0.85'
+
+  auto-assign:
+    description: 'Automatically assign suggested team members to issues'
+    required: false
+    default: 'false'
+
+outputs:
+  labels-applied:
+    description: 'Comma-separated list of labels that were applied to the issue'
+
+  is-duplicate:
+    description: 'Boolean string ("true"/"false") indicating if a potential duplicate was found'
+
+  severity:
+    description: 'Detected severity level (low/medium/high/critical)'
+
+  issue-type:
+    description: 'Detected issue type (bug/feature/question/docs/security/other)'
+
+  summary:
+    description: 'AI-generated one-sentence summary of the issue'
+
+runs:
+  using: 'node20'
+  main: 'dist/action/index.js'
