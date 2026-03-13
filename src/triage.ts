@@ -1,10 +1,16 @@
-import { IssuePilotConfig, TriageResult, IssueContext, DuplicateMatch, LabelSuggestion } from './types.js';
+import {
+  IssuePilotConfig,
+  TriageResult,
+  IssueContext,
+  DuplicateMatch,
+  LabelSuggestion,
+} from './types.js';
 import { getIssue, getRecentIssues, addLabels, addComment, assignIssue } from './github.js';
-import { analyzeIssue } from './ai.js';
+import { analyzeIssueWithUsage } from './ai.js';
 import { findDuplicates } from './duplicate.js';
 
 /**
- * Triage a single GitHub issue.
+ * Triage a single GitHub issue: fetch, analyze, detect duplicates, apply labels & comment.
  */
 export async function triageIssue(
   config: IssuePilotConfig,
@@ -12,16 +18,18 @@ export async function triageIssue(
   repo: string,
   issueNumber: number
 ): Promise<TriageResult> {
+  const startTime = Date.now();
+
   // 1. Fetch the issue from GitHub
   const issue = await getIssue(config.githubToken, owner, repo, issueNumber);
 
   // 2. Get recent issues for duplicate detection
   const recentIssues = await getRecentIssues(config.githubToken, owner, repo, 100);
 
-  // 3. Call AI for analysis
-  const analysis = await analyzeIssue(issue.title, issue.body, config);
+  // 3. AI analysis with token usage tracking
+  const { analysis, tokenUsage } = await analyzeIssueWithUsage(issue.title, issue.body, config);
 
-  // 4. Find duplicates
+  // 4. Find duplicates using hybrid similarity
   const duplicates = findDuplicates(
     issue,
     recentIssues,
@@ -30,29 +38,22 @@ export async function triageIssue(
   );
 
   // 5. Determine labels to apply
-  const labelsToApply = selectLabels(analysis.suggestedLabels, duplicates, analysis.severity);
+  const confidenceThreshold = config.confidenceThreshold ?? 0.7;
+  const labelsToApply = selectLabels(analysis.suggestedLabels, duplicates, analysis.severity, confidenceThreshold);
   const appliedLabels: string[] = [];
+  const processingTimeMs = Date.now() - startTime;
 
   if (!config.dryRun) {
-    // Apply labels
     if (labelsToApply.length > 0) {
       await addLabels(config.githubToken, owner, repo, issueNumber, labelsToApply);
       appliedLabels.push(...labelsToApply);
     }
 
-    // Assign issue if configured and assignees suggested
     if (config.autoAssign && analysis.suggestedAssignees.length > 0) {
-      await assignIssue(
-        config.githubToken,
-        owner,
-        repo,
-        issueNumber,
-        analysis.suggestedAssignees
-      );
+      await assignIssue(config.githubToken, owner, repo, issueNumber, analysis.suggestedAssignees);
     }
 
-    // Post triage comment
-    const comment = buildTriageComment(issue, analysis, duplicates, labelsToApply);
+    const comment = buildTriageComment(issue, analysis, duplicates, labelsToApply, confidenceThreshold);
     await addComment(config.githubToken, owner, repo, issueNumber, comment);
 
     return {
@@ -62,6 +63,8 @@ export async function triageIssue(
       appliedLabels,
       commentPosted: true,
       dryRun: false,
+      processingTimeMs,
+      tokenUsage,
     };
   }
 
@@ -69,14 +72,16 @@ export async function triageIssue(
     issue,
     analysis,
     duplicates,
-    appliedLabels: labelsToApply, // Show what would be applied
+    appliedLabels: labelsToApply,
     commentPosted: false,
     dryRun: true,
+    processingTimeMs,
+    tokenUsage,
   };
 }
 
 /**
- * Triage all recent open issues in a repository.
+ * Triage all recent open issues in a repository with rate limiting.
  */
 export async function triageAllIssues(
   config: IssuePilotConfig,
@@ -84,17 +89,16 @@ export async function triageAllIssues(
   repo: string,
   limit = 20
 ): Promise<TriageResult[]> {
-  const recentIssues = await getRecentIssues(config.githubToken, owner, repo, limit);
-  const openIssues = recentIssues.filter((i) => true); // Already filtered by getRecentIssues
-
+  const effectiveLimit = Math.min(limit, config.maxIssues ?? 50);
+  const recentIssues = await getRecentIssues(config.githubToken, owner, repo, effectiveLimit);
   const results: TriageResult[] = [];
 
-  for (const issue of openIssues.slice(0, limit)) {
+  for (const issue of recentIssues.slice(0, effectiveLimit)) {
     try {
       const result = await triageIssue(config, owner, repo, issue.number);
       results.push(result);
 
-      // Small delay to avoid rate limiting
+      // Respect GitHub's secondary rate limit
       await new Promise((resolve) => setTimeout(resolve, 500));
     } catch (error) {
       console.error(`Failed to triage issue #${issue.number}: ${error}`);
@@ -105,29 +109,27 @@ export async function triageAllIssues(
 }
 
 /**
- * Select which labels to apply based on AI suggestions and context.
+ * Select labels to apply based on AI suggestions, duplicates, and severity.
  */
 function selectLabels(
   suggestedLabels: LabelSuggestion[],
   duplicates: DuplicateMatch[],
-  severity: string
+  severity: string,
+  confidenceThreshold: number
 ): string[] {
   const labels = new Set<string>();
 
-  // Add high-confidence AI suggested labels (confidence >= 0.7)
   for (const suggestion of suggestedLabels) {
-    if (suggestion.confidence >= 0.7) {
+    if (suggestion.confidence >= confidenceThreshold) {
       labels.add(suggestion.name);
     }
   }
 
-  // Add severity label
   const severityLabel = getSeverityLabel(severity);
   if (severityLabel) {
     labels.add(severityLabel);
   }
 
-  // Add duplicate label if duplicates found
   if (duplicates.length > 0) {
     labels.add('duplicate');
   }
@@ -135,9 +137,6 @@ function selectLabels(
   return Array.from(labels);
 }
 
-/**
- * Map severity to label name.
- */
 function getSeverityLabel(severity: string): string | null {
   const map: Record<string, string> = {
     low: 'low-priority',
@@ -145,17 +144,25 @@ function getSeverityLabel(severity: string): string | null {
     high: 'high-priority',
     critical: 'critical',
   };
-  return map[severity] || null;
+  return map[severity] ?? null;
 }
 
 /**
- * Build the triage comment markdown.
+ * Build the markdown triage comment.
  */
 function buildTriageComment(
   issue: IssueContext,
-  analysis: { summary: string; issueType: string; severity: string; suggestedLabels: LabelSuggestion[]; suggestedAssignees: string[]; additionalContext: string },
+  analysis: {
+    summary: string;
+    issueType: string;
+    severity: string;
+    suggestedLabels: LabelSuggestion[];
+    suggestedAssignees: string[];
+    additionalContext: string;
+  },
   duplicates: DuplicateMatch[],
-  appliedLabels: string[]
+  appliedLabels: string[],
+  confidenceThreshold: number
 ): string {
   const typeEmoji: Record<string, string> = {
     bug: '🐛',
@@ -173,14 +180,16 @@ function buildTriageComment(
     critical: '🔴',
   };
 
-  const issueTypeDisplay = `${typeEmoji[analysis.issueType] || '📌'} ${capitalize(analysis.issueType)}`;
-  const severityDisplay = `${severityEmoji[analysis.severity] || '⚪'} ${capitalize(analysis.severity)}`;
+  const issueTypeDisplay = `${typeEmoji[analysis.issueType] ?? '📌'} ${capitalize(analysis.issueType)}`;
+  const severityDisplay = `${severityEmoji[analysis.severity] ?? '⚪'} ${capitalize(analysis.severity)}`;
 
   let comment = `## 🤖 Issue Pilot Triage Report
 
-**Type:** ${issueTypeDisplay} | **Severity:** ${severityDisplay}
-
-**Summary:** ${analysis.summary}
+| Field | Value |
+|-------|-------|
+| **Type** | ${issueTypeDisplay} |
+| **Severity** | ${severityDisplay} |
+| **Summary** | ${analysis.summary} |
 
 `;
 
@@ -190,22 +199,38 @@ function buildTriageComment(
     for (const labelName of appliedLabels) {
       const suggestion = analysis.suggestedLabels.find((s) => s.name === labelName);
       const reason = suggestion?.reason || getLabelDefaultReason(labelName, analysis);
-      comment += `- \`${labelName}\` — ${reason}\n`;
+      const confidence = suggestion ? ` *(${Math.round(suggestion.confidence * 100)}% confidence)*` : '';
+      comment += `- \`${labelName}\` — ${reason}${confidence}\n`;
     }
     comment += '\n';
   } else {
-    comment += `### 📋 Labels\nNo labels were automatically applied for this issue.\n\n`;
+    comment += `### 📋 Labels\nNo labels met the confidence threshold (${Math.round(confidenceThreshold * 100)}%) for automatic application.\n\n`;
+  }
+
+  // AI Label Suggestions below threshold (informational)
+  const lowConfidenceSuggestions = analysis.suggestedLabels.filter(
+    (s) => s.confidence < confidenceThreshold && !appliedLabels.includes(s.name)
+  );
+  if (lowConfidenceSuggestions.length > 0) {
+    comment += `<details>\n<summary>💡 Additional label suggestions (below threshold)</summary>\n\n`;
+    for (const s of lowConfidenceSuggestions) {
+      comment += `- \`${s.name}\` — ${s.reason} *(${Math.round(s.confidence * 100)}% confidence)*\n`;
+    }
+    comment += `\n</details>\n\n`;
   }
 
   // Potential Duplicates section
   if (duplicates.length > 0) {
     comment += `### 🔍 Potential Duplicates\n`;
-    comment += `This issue may be related to existing issues:\n\n`;
+    comment += `This issue may be related to ${duplicates.length} existing issue${duplicates.length > 1 ? 's' : ''}:\n\n`;
     for (const dup of duplicates) {
       const pct = Math.round(dup.similarity * 100);
-      comment += `- [#${dup.issueNumber}](${dup.url}) — ${dup.title} *(${pct}% similarity)*\n`;
+      const keywords = dup.matchedKeywords.length > 0
+        ? ` — matched: \`${dup.matchedKeywords.join('`, `')}\``
+        : '';
+      comment += `- [#${dup.issueNumber}](${dup.url}) **${dup.title}** *(${pct}% similarity${keywords})*\n`;
     }
-    comment += `\nPlease check if your issue is already covered before adding new information.\n\n`;
+    comment += `\n> Please check if your issue is already covered. If it is a duplicate, close this issue and link to the original.\n\n`;
   }
 
   // Suggested Assignees section
@@ -223,7 +248,7 @@ function buildTriageComment(
     comment += '\n\n';
   }
 
-  comment += `---\n*Triaged by [Issue Pilot](https://github.com/sunqiang/issue-pilot) 🚀 — AI-powered issue triage*`;
+  comment += `---\n*Triaged by [Issue Pilot](https://github.com/sunqiang/issue-pilot) 🚀 — AI-powered issue triage for GitHub*`;
 
   return comment;
 }
@@ -237,34 +262,73 @@ function getLabelDefaultReason(
   analysis: { issueType: string; severity: string }
 ): string {
   const reasons: Record<string, string> = {
-    'bug': 'This issue describes unexpected behavior',
-    'feature': 'This is a feature or enhancement request',
-    'question': 'This issue is a question or support request',
-    'docs': 'This is related to documentation',
-    'security': 'This issue involves a security concern',
-    'low-priority': 'Classified as low severity',
-    'medium-priority': 'Classified as medium severity',
-    'high-priority': 'Classified as high severity',
-    'critical': 'Classified as critical — requires immediate attention',
-    'duplicate': 'Potential duplicate of an existing issue detected',
-    'needs-info': 'Additional information needed to proceed',
+    'bug': 'Describes unexpected behavior or a defect',
+    'feature': 'Requests new functionality or enhancement',
+    'question': 'Seeks information or clarification',
+    'docs': 'Related to documentation improvements',
+    'security': 'Involves a security vulnerability or concern',
+    'low-priority': 'Assessed as low severity with minimal user impact',
+    'medium-priority': 'Assessed as medium severity with moderate user impact',
+    'high-priority': 'Assessed as high severity requiring prompt attention',
+    'critical': 'Critical issue requiring immediate attention',
+    'duplicate': 'Likely duplicate of an existing open issue',
+    'needs-info': 'Requires additional information to proceed',
+    'good-first-issue': 'Suitable for new contributors',
+    'help-wanted': 'Community help is welcome on this issue',
+    'wontfix': 'This will not be worked on',
+    'invalid': 'This issue is not valid or cannot be reproduced',
+    'enhancement': 'Improvement to an existing feature',
   };
-  return reasons[labelName] || `Applied based on ${analysis.issueType} classification`;
+  return reasons[labelName] ?? `Applied based on ${analysis.issueType} classification`;
 }
 
 function getDefaultNextSteps(issueType: string, hasDuplicates: boolean): string {
   if (hasDuplicates) {
-    return '1. Review the potential duplicates listed above\n2. If this is indeed a duplicate, please close this issue and add a comment to the original\n3. If this is a new issue, please provide additional context to differentiate it';
+    return [
+      '1. Review the potential duplicates listed above',
+      '2. If this is indeed a duplicate, please close this issue and comment on the original',
+      '3. If this is a distinct issue, provide additional context to differentiate it',
+    ].join('\n');
   }
 
   const steps: Record<string, string> = {
-    bug: '1. Please ensure steps to reproduce are clearly described\n2. Include your environment details (OS, version, etc.)\n3. A maintainer will review and prioritize this bug report',
-    feature: '1. Describe the problem this feature would solve\n2. Share any implementation ideas you have\n3. A maintainer will review feasibility and fit with project goals',
-    question: '1. Check the documentation and existing issues first\n2. If your question is not answered, a maintainer will respond shortly\n3. Consider joining our community discussions',
-    docs: '1. Point to the specific documentation that needs updating\n2. Suggest the correct information if possible\n3. A maintainer will review and update the docs',
-    security: '⚠️ **Security Notice**: Please do not share exploit details publicly\n1. If this is a sensitive vulnerability, consider using private disclosure\n2. A security maintainer will review this promptly',
-    other: '1. A maintainer will review this issue and provide guidance\n2. Please provide any additional context that might help',
+    bug: [
+      '1. Ensure steps to reproduce are clearly described',
+      '2. Include environment details (OS, runtime version, browser, etc.)',
+      '3. Attach any relevant logs, screenshots, or error messages',
+      '4. A maintainer will review and prioritize this bug report',
+    ].join('\n'),
+
+    feature: [
+      '1. Describe the problem this feature would solve (the "why")',
+      '2. Share any implementation ideas or design sketches if you have them',
+      '3. A maintainer will review feasibility and alignment with project goals',
+    ].join('\n'),
+
+    question: [
+      '1. Check the documentation and existing issues/discussions first',
+      '2. If not answered there, a maintainer will respond shortly',
+      '3. Consider joining community discussions for faster responses',
+    ].join('\n'),
+
+    docs: [
+      '1. Point to the specific page or section that needs updating',
+      '2. Suggest the correct information if possible',
+      '3. A maintainer will review and update the documentation',
+    ].join('\n'),
+
+    security: [
+      '⚠️ **Security Notice**: If this is a sensitive vulnerability, consider using private disclosure',
+      '1. Do not share exploit details publicly in this issue',
+      '2. A security maintainer will review this issue promptly',
+      '3. We appreciate responsible disclosure and will credit you in the fix',
+    ].join('\n'),
+
+    other: [
+      '1. A maintainer will review this issue and provide guidance',
+      '2. Please provide any additional context that might be helpful',
+    ].join('\n'),
   };
 
-  return steps[issueType] || steps.other;
+  return steps[issueType] ?? steps.other;
 }

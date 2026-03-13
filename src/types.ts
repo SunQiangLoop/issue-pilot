@@ -12,6 +12,9 @@ export interface IssuePilotConfig {
   duplicateThreshold: number;
   dryRun: boolean;
   verbose: boolean;
+  model: string;
+  maxIssues: number;
+  confidenceThreshold: number;
 }
 
 export type IssueSeverity = 'low' | 'medium' | 'high' | 'critical';
@@ -39,6 +42,8 @@ export interface IssueContext {
   author: string;
   createdAt: string;
   url: string;
+  state?: string;
+  commentCount?: number;
 }
 
 export interface AIAnalysis {
@@ -51,6 +56,13 @@ export interface AIAnalysis {
   additionalContext: string;
 }
 
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  estimatedCostUSD: number;
+}
+
 export interface TriageResult {
   issue: IssueContext;
   analysis: AIAnalysis;
@@ -58,6 +70,25 @@ export interface TriageResult {
   appliedLabels: string[];
   commentPosted: boolean;
   dryRun: boolean;
+  processingTimeMs?: number;
+  tokenUsage?: TokenUsage;
+}
+
+export interface TriageStats {
+  totalIssues: number;
+  labeledIssues: number;
+  duplicatesFound: number;
+  avgConfidence: number;
+  severityBreakdown: Record<IssueSeverity, number>;
+  typeBreakdown: Record<IssueType, number>;
+  totalTokenUsage: TokenUsage;
+  processingTimeMs: number;
+}
+
+export interface CacheEntry<T> {
+  data: T;
+  expiresAt: number;
+  key: string;
 }
 
 export interface GitHubIssue {
@@ -70,4 +101,12 @@ export interface GitHubIssue {
   created_at: string;
   html_url: string;
   assignees: Array<{ login: string }>;
+  comments?: number;
+}
+
+export interface RateLimitInfo {
+  limit: number;
+  remaining: number;
+  reset: number;
+  used: number;
 }

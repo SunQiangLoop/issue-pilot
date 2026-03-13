@@ -1,11 +1,24 @@
 import { Octokit } from '@octokit/rest';
-import { GitHubIssue, IssueContext, LabelConfig } from './types.js';
+import { GitHubIssue, IssueContext, LabelConfig, RateLimitInfo } from './types.js';
+import { contributorsCache, recentIssuesCache } from './cache.js';
 
 let octokitInstance: Octokit | null = null;
 
 function getOctokit(token: string): Octokit {
   if (!octokitInstance) {
-    octokitInstance = new Octokit({ auth: token });
+    octokitInstance = new Octokit({
+      auth: token,
+      throttle: {
+        onRateLimit: (retryAfter: number, options: { method: string; url: string }) => {
+          console.warn(`Rate limit hit for ${options.method} ${options.url} — retrying after ${retryAfter}s`);
+          return true; // Retry once
+        },
+        onSecondaryRateLimit: (retryAfter: number, options: { method: string; url: string }) => {
+          console.warn(`Secondary rate limit hit for ${options.method} ${options.url}`);
+          return retryAfter < 60; // Only retry if wait is under 60s
+        },
+      },
+    });
   }
   return octokitInstance;
 }
@@ -33,8 +46,11 @@ export async function getRecentIssues(
   repo: string,
   limit = 100
 ): Promise<IssueContext[]> {
-  const octokit = getOctokit(token);
+  const cacheKey = `${owner}/${repo}/issues/${limit}`;
+  const cached = recentIssuesCache.get(cacheKey) as IssueContext[] | null;
+  if (cached) return cached;
 
+  const octokit = getOctokit(token);
   const issues: IssueContext[] = [];
   let page = 1;
   const perPage = Math.min(limit, 100);
@@ -52,7 +68,6 @@ export async function getRecentIssues(
 
     if (data.length === 0) break;
 
-    // Filter out pull requests
     const filteredIssues = data.filter((issue) => !('pull_request' in issue));
     issues.push(...filteredIssues.map((i) => mapGitHubIssue(i as unknown as GitHubIssue)));
 
@@ -60,7 +75,9 @@ export async function getRecentIssues(
     page++;
   }
 
-  return issues.slice(0, limit);
+  const result = issues.slice(0, limit);
+  recentIssuesCache.set(cacheKey, result);
+  return result;
 }
 
 export async function addLabels(
@@ -125,27 +142,15 @@ export async function createLabel(
   const octokit = getOctokit(token);
 
   try {
-    await octokit.issues.createLabel({
-      owner,
-      repo,
-      name,
-      color,
-      description,
-    });
+    await octokit.issues.createLabel({ owner, repo, name, color, description });
   } catch (error: unknown) {
-    // If label already exists (422), update it
     if (
       error instanceof Error &&
       'status' in error &&
       (error as { status: number }).status === 422
     ) {
-      await octokit.issues.updateLabel({
-        owner,
-        repo,
-        name,
-        color,
-        description,
-      });
+      // Label already exists — update it instead
+      await octokit.issues.updateLabel({ owner, repo, name, color, description });
     } else {
       throw error;
     }
@@ -160,7 +165,6 @@ export async function ensureLabelsExist(
 ): Promise<{ created: string[]; updated: string[]; existing: string[] }> {
   const octokit = getOctokit(token);
 
-  // Get existing labels
   const { data: existingLabels } = await octokit.issues.listLabelsForRepo({
     owner,
     repo,
@@ -168,7 +172,6 @@ export async function ensureLabelsExist(
   });
 
   const existingLabelMap = new Map(existingLabels.map((l) => [l.name, l]));
-
   const created: string[] = [];
   const updated: string[] = [];
   const existing: string[] = [];
@@ -205,6 +208,10 @@ export async function getRepositoryContributors(
   repo: string,
   limit = 20
 ): Promise<string[]> {
+  const cacheKey = `${owner}/${repo}/contributors`;
+  const cached = contributorsCache.get(cacheKey);
+  if (cached) return cached;
+
   const octokit = getOctokit(token);
 
   try {
@@ -214,12 +221,38 @@ export async function getRepositoryContributors(
       per_page: limit,
     });
 
-    return data
+    const contributors = data
       .filter((c) => c.type === 'User' && c.login)
       .map((c) => c.login as string);
+
+    contributorsCache.set(cacheKey, contributors);
+    return contributors;
   } catch {
     return [];
   }
+}
+
+/**
+ * Fetch current GitHub API rate limit status.
+ */
+export async function getRateLimitInfo(token: string): Promise<RateLimitInfo> {
+  const octokit = getOctokit(token);
+  const { data } = await octokit.rateLimit.get();
+  const core = data.rate;
+
+  return {
+    limit: core.limit,
+    remaining: core.remaining,
+    reset: core.reset,
+    used: core.used,
+  };
+}
+
+/**
+ * Check if the API rate limit is critically low (<10% remaining).
+ */
+export function isRateLimitLow(info: RateLimitInfo): boolean {
+  return info.remaining < info.limit * 0.1;
 }
 
 function mapGitHubIssue(issue: GitHubIssue): IssueContext {
@@ -231,6 +264,8 @@ function mapGitHubIssue(issue: GitHubIssue): IssueContext {
     author: issue.user?.login || 'unknown',
     createdAt: issue.created_at,
     url: issue.html_url,
+    state: issue.state,
+    commentCount: issue.comments,
   };
 }
 

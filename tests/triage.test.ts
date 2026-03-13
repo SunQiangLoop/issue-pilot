@@ -12,6 +12,7 @@ vi.mock('../src/github.js', () => ({
 
 vi.mock('../src/ai.js', () => ({
   analyzeIssue: vi.fn(),
+  analyzeIssueWithUsage: vi.fn(),
 }));
 
 vi.mock('../src/duplicate.js', () => ({
@@ -21,6 +22,7 @@ vi.mock('../src/duplicate.js', () => ({
 import { triageIssue } from '../src/triage.js';
 import * as github from '../src/github.js';
 import * as ai from '../src/ai.js';
+import type { AnalyzeResult } from '../src/ai.js';
 import * as duplicate from '../src/duplicate.js';
 
 const mockConfig: IssuePilotConfig = {
@@ -67,6 +69,10 @@ describe('triageIssue', () => {
     vi.mocked(github.addLabels).mockResolvedValue();
     vi.mocked(github.addComment).mockResolvedValue();
     vi.mocked(ai.analyzeIssue).mockResolvedValue(mockAnalysis);
+    vi.mocked(ai.analyzeIssueWithUsage).mockResolvedValue({
+      analysis: mockAnalysis,
+      tokenUsage: { promptTokens: 100, completionTokens: 50, totalTokens: 150, estimatedCostUSD: 0.001 },
+    } as AnalyzeResult);
     vi.mocked(duplicate.findDuplicates).mockReturnValue([]);
   });
 
@@ -95,12 +101,15 @@ describe('triageIssue', () => {
   });
 
   it('does not apply low-confidence labels', async () => {
-    vi.mocked(ai.analyzeIssue).mockResolvedValue({
-      ...mockAnalysis,
-      suggestedLabels: [
-        { name: 'bug', reason: 'Might be a bug', confidence: 0.4 },
-      ],
-    });
+    vi.mocked(ai.analyzeIssueWithUsage).mockResolvedValue({
+      analysis: {
+        ...mockAnalysis,
+        suggestedLabels: [
+          { name: 'bug', reason: 'Might be a bug', confidence: 0.4 },
+        ],
+      },
+      tokenUsage: { promptTokens: 100, completionTokens: 50, totalTokens: 150, estimatedCostUSD: 0.001 },
+    } as AnalyzeResult);
 
     const result = await triageIssue(mockConfig, 'owner', 'repo', 42);
     // 'bug' should not be in applied labels since confidence is below 0.7
@@ -152,7 +161,7 @@ describe('triageIssue', () => {
   it('calls AI analysis with issue content', async () => {
     await triageIssue(mockConfig, 'owner', 'repo', 42);
 
-    expect(ai.analyzeIssue).toHaveBeenCalledWith(
+    expect(ai.analyzeIssueWithUsage).toHaveBeenCalledWith(
       mockIssue.title,
       mockIssue.body,
       mockConfig
@@ -185,10 +194,10 @@ describe('triageIssue', () => {
 
   it('assigns issue when autoAssign is true and assignees are suggested', async () => {
     const configWithAutoAssign = { ...mockConfig, autoAssign: true };
-    vi.mocked(ai.analyzeIssue).mockResolvedValue({
-      ...mockAnalysis,
-      suggestedAssignees: ['maintainer1'],
-    });
+    vi.mocked(ai.analyzeIssueWithUsage).mockResolvedValue({
+      analysis: { ...mockAnalysis, suggestedAssignees: ['maintainer1'] },
+      tokenUsage: { promptTokens: 100, completionTokens: 50, totalTokens: 150, estimatedCostUSD: 0.001 },
+    } as AnalyzeResult);
 
     await triageIssue(configWithAutoAssign, 'owner', 'repo', 42);
 
@@ -202,10 +211,10 @@ describe('triageIssue', () => {
   });
 
   it('does not assign when autoAssign is false', async () => {
-    vi.mocked(ai.analyzeIssue).mockResolvedValue({
-      ...mockAnalysis,
-      suggestedAssignees: ['maintainer1'],
-    });
+    vi.mocked(ai.analyzeIssueWithUsage).mockResolvedValue({
+      analysis: { ...mockAnalysis, suggestedAssignees: ['maintainer1'] },
+      tokenUsage: { promptTokens: 100, completionTokens: 50, totalTokens: 150, estimatedCostUSD: 0.001 },
+    } as AnalyzeResult);
 
     await triageIssue(mockConfig, 'owner', 'repo', 42);
 

@@ -1,29 +1,56 @@
 import { IssueContext, DuplicateMatch } from './types.js';
 
 /**
- * Tokenize text into normalized terms for TF-IDF computation.
+ * Split camelCase and snake_case identifiers into individual tokens.
+ * e.g. "crashOnFileUpload" → ["crash", "file", "upload"]
+ *      "file_upload_error"  → ["file", "upload", "error"]
  */
-function tokenize(text: string): string[] {
+function splitIdentifiers(text: string): string {
   return text
-    .toLowerCase()
-    .replace(/```[\s\S]*?```/g, ' ') // Remove code blocks
-    .replace(/`[^`]+`/g, ' ')        // Remove inline code
-    .replace(/https?:\/\/\S+/g, ' ') // Remove URLs
-    .replace(/[^a-z0-9\s]/g, ' ')   // Remove punctuation
-    .split(/\s+/)
-    .filter((token) => token.length > 2)
-    .filter((token) => !STOP_WORDS.has(token));
+    .replace(/_/g, ' ')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2');
 }
 
 /**
- * Compute term frequency for a list of tokens.
+ * Normalize version strings to a generic token to reduce noise.
+ * e.g. "v1.2.3", "2.0.0-beta" → "versiontoken"
+ */
+function normalizeVersions(text: string): string {
+  return text.replace(/\bv?\d+\.\d+(\.\d+)*(-[a-z0-9]+)?\b/gi, 'versiontoken');
+}
+
+/**
+ * Tokenize text into normalized terms for TF-IDF computation.
+ * Handles: code blocks, inline code, URLs, camelCase, snake_case, version strings.
+ */
+function tokenize(text: string): string[] {
+  return splitIdentifiers(
+      normalizeVersions(
+        text
+          .toLowerCase()
+          .replace(/```[\s\S]*?```/g, ' ')  // Remove fenced code blocks
+          .replace(/`[^`]+`/g, ' ')          // Remove inline code
+          .replace(/https?:\/\/\S+/g, ' ')  // Remove URLs
+          .replace(/<!--[\s\S]*?-->/g, ' ') // Remove HTML comments
+          .replace(/#\d+/g, ' ')            // Remove issue/PR references like #123
+      )
+    )
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((token) => token.length > 2 && !STOP_WORDS.has(token));
+}
+
+/**
+ * Compute term frequency (normalized) for a list of tokens.
  */
 function computeTF(tokens: string[]): Map<string, number> {
+  if (tokens.length === 0) return new Map();
+
   const tf = new Map<string, number>();
   for (const token of tokens) {
     tf.set(token, (tf.get(token) || 0) + 1);
   }
-  // Normalize by document length
   for (const [term, count] of tf) {
     tf.set(term, count / tokens.length);
   }
@@ -32,6 +59,7 @@ function computeTF(tokens: string[]): Map<string, number> {
 
 /**
  * Compute inverse document frequency for a corpus.
+ * Uses smoothed IDF: log((N+1)/(df+1)) + 1
  */
 function computeIDF(corpus: string[][]): Map<string, number> {
   const docFreq = new Map<string, number>();
@@ -48,7 +76,6 @@ function computeIDF(corpus: string[][]): Map<string, number> {
   for (const [term, df] of docFreq) {
     idf.set(term, Math.log((N + 1) / (df + 1)) + 1);
   }
-
   return idf;
 }
 
@@ -60,10 +87,9 @@ function computeTFIDF(tokens: string[], idf: Map<string, number>): Map<string, n
   const tfidf = new Map<string, number>();
 
   for (const [term, tfScore] of tf) {
-    const idfScore = idf.get(term) || Math.log(2); // Default IDF for unknown terms
+    const idfScore = idf.get(term) ?? Math.log(2);
     tfidf.set(term, tfScore * idfScore);
   }
-
   return tfidf;
 }
 
@@ -76,22 +102,39 @@ function cosineSimilarity(vecA: Map<string, number>, vecB: Map<string, number>):
   let normB = 0;
 
   for (const [term, scoreA] of vecA) {
-    const scoreB = vecB.get(term) || 0;
-    dotProduct += scoreA * scoreB;
+    dotProduct += scoreA * (vecB.get(term) ?? 0);
     normA += scoreA * scoreA;
   }
-
   for (const scoreB of vecB.values()) {
     normB += scoreB * scoreB;
   }
 
   if (normA === 0 || normB === 0) return 0;
-
   return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
 /**
- * Compute a keyword boost score for two issues based on shared AI-extracted keywords.
+ * Compute Jaccard similarity between two token sets.
+ * Useful as a complementary signal to TF-IDF for short texts like titles.
+ */
+function jaccardSimilarity(tokensA: string[], tokensB: string[]): number {
+  if (tokensA.length === 0 && tokensB.length === 0) return 1;
+  if (tokensA.length === 0 || tokensB.length === 0) return 0;
+
+  const setA = new Set(tokensA);
+  const setB = new Set(tokensB);
+
+  let intersection = 0;
+  for (const token of setA) {
+    if (setB.has(token)) intersection++;
+  }
+
+  const union = setA.size + setB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+/**
+ * Compute keyword boost score based on AI-extracted keywords found in candidate text.
  */
 function computeKeywordBoost(keywords: string[], issueText: string): number {
   if (keywords.length === 0) return 0;
@@ -104,12 +147,11 @@ function computeKeywordBoost(keywords: string[], issueText: string): number {
       matches++;
     }
   }
-
   return matches / keywords.length;
 }
 
 /**
- * Get the matched keywords between an issue and a candidate.
+ * Get the list of keywords that matched in the candidate text.
  */
 function getMatchedKeywords(keywords: string[], issueText: string): string[] {
   const normalizedText = issueText.toLowerCase();
@@ -117,13 +159,16 @@ function getMatchedKeywords(keywords: string[], issueText: string): string[] {
 }
 
 /**
- * Find potential duplicate issues using TF-IDF similarity and keyword boosting.
+ * Find potential duplicate issues using a hybrid similarity approach:
+ * - TF-IDF cosine similarity (body + title weighted)
+ * - Jaccard similarity on title tokens
+ * - AI keyword boost (up to 20%)
  *
  * @param newIssue - The new issue to check for duplicates
- * @param existingIssues - The existing issues to compare against
- * @param threshold - Minimum similarity score (0-1) to consider as duplicate
- * @param aiKeywords - Keywords extracted by AI to boost matching
- * @returns Top matching issues above the threshold
+ * @param existingIssues - Existing issues to compare against
+ * @param threshold - Minimum similarity score (0–1) to include
+ * @param aiKeywords - Keywords extracted by AI for boosted matching
+ * @returns Top 3 matches sorted by similarity descending
  */
 export function findDuplicates(
   newIssue: IssueContext,
@@ -131,73 +176,69 @@ export function findDuplicates(
   threshold: number,
   aiKeywords: string[] = []
 ): DuplicateMatch[] {
-  // Exclude the new issue itself from candidates
+  // Exclude the current issue from candidates
   const candidates = existingIssues.filter((i) => i.number !== newIssue.number);
-
   if (candidates.length === 0) return [];
 
-  // Prepare text for each document (title weighted 3x for importance)
+  // Title is weighted 3x to amplify its importance in similarity scoring
   const newIssueText = `${newIssue.title} ${newIssue.title} ${newIssue.title} ${newIssue.body}`;
-  const candidateTexts = candidates.map(
-    (c) => `${c.title} ${c.title} ${c.title} ${c.body}`
-  );
+  const candidateTexts = candidates.map((c) => `${c.title} ${c.title} ${c.title} ${c.body}`);
 
-  // Tokenize all documents
   const newTokens = tokenize(newIssueText);
   const candidateTokens = candidateTexts.map(tokenize);
 
-  // Build corpus for IDF computation
   const corpus = [newTokens, ...candidateTokens];
   const idf = computeIDF(corpus);
 
-  // Compute TF-IDF for new issue
   const newTFIDF = computeTFIDF(newTokens, idf);
+  const newTitleTokens = tokenize(newIssue.title);
 
-  // Compute similarities for each candidate
   const matches: DuplicateMatch[] = [];
 
   for (let i = 0; i < candidates.length; i++) {
     const candidate = candidates[i];
     const candidateTFIDF = computeTFIDF(candidateTokens[i], idf);
 
-    // Base TF-IDF cosine similarity
-    let similarity = cosineSimilarity(newTFIDF, candidateTFIDF);
+    // Signal 1: Full-text TF-IDF cosine similarity
+    const tfidfSimilarity = cosineSimilarity(newTFIDF, candidateTFIDF);
 
-    // Apply keyword boost (max 20% boost)
+    // Signal 2: AI keyword boost (max +20%)
     const candidateFullText = `${candidate.title} ${candidate.body}`;
     const keywordBoost = computeKeywordBoost(aiKeywords, candidateFullText);
-    const boostedSimilarity = Math.min(1, similarity + keywordBoost * 0.2);
+    const boostedTFIDF = Math.min(1, tfidfSimilarity + keywordBoost * 0.2);
 
-    // Title-only similarity as additional signal
-    const newTitleTokens = tokenize(newIssue.title);
+    // Signal 3: Title-only Jaccard + TF-IDF combination
     const candidateTitleTokens = tokenize(candidate.title);
+    let titleSimilarity = 0;
+
     if (newTitleTokens.length > 0 && candidateTitleTokens.length > 0) {
       const titleCorpus = [newTitleTokens, candidateTitleTokens];
       const titleIDF = computeIDF(titleCorpus);
       const newTitleTFIDF = computeTFIDF(newTitleTokens, titleIDF);
       const candidateTitleTFIDF = computeTFIDF(candidateTitleTokens, titleIDF);
-      const titleSimilarity = cosineSimilarity(newTitleTFIDF, candidateTitleTFIDF);
 
-      // Weighted average: 60% body+title TF-IDF, 40% title-only similarity
-      similarity = boostedSimilarity * 0.6 + titleSimilarity * 0.4;
-    } else {
-      similarity = boostedSimilarity;
+      const titleTFIDF = cosineSimilarity(newTitleTFIDF, candidateTitleTFIDF);
+      const titleJaccard = jaccardSimilarity(newTitleTokens, candidateTitleTokens);
+
+      // Combine TF-IDF and Jaccard for title similarity
+      titleSimilarity = titleTFIDF * 0.6 + titleJaccard * 0.4;
     }
 
+    // Final score: 55% full-text (boosted), 45% title-only
+    const finalSimilarity = boostedTFIDF * 0.55 + titleSimilarity * 0.45;
     const matchedKeywords = getMatchedKeywords(aiKeywords, candidateFullText);
 
-    if (similarity >= threshold) {
+    if (finalSimilarity >= threshold) {
       matches.push({
         issueNumber: candidate.number,
         title: candidate.title,
         url: candidate.url,
-        similarity: Math.round(similarity * 100) / 100,
+        similarity: Math.round(finalSimilarity * 100) / 100,
         matchedKeywords,
       });
     }
   }
 
-  // Sort by similarity descending and return top 3
   return matches
     .sort((a, b) => b.similarity - a.similarity)
     .slice(0, 3);
@@ -219,9 +260,17 @@ const STOP_WORDS = new Set([
   'should', 'shall', 'may', 'might', 'must', 'need', 'used', 'using',
   'please', 'thanks', 'hello', 'hi', 'hey', 'okay', 'yes', 'much',
   'more', 'very', 'really', 'quite', 'still', 'too', 'here', 'there',
-  'where', 'why', 'who', 'whom', 'whose', 'which', 'while', 'though',
-  'although', 'since', 'before', 'after', 'during', 'between', 'through',
+  'where', 'why', 'who', 'whom', 'whose', 'while', 'though', 'let',
+  'although', 'since', 'before', 'during', 'between', 'through', 'via',
   'without', 'within', 'along', 'across', 'below', 'above', 'down',
   'under', 'again', 'further', 'once', 'same', 'such', 'both', 'few',
-  'more', 'other', 'each', 'every', 'either', 'neither', 'own', 'per',
+  'each', 'every', 'either', 'neither', 'own', 'per', 'set', 'put',
+  'run', 'add', 'try', 'fix', 'get', 'got', 'see', 'saw', 'show',
+  'call', 'find', 'keep', 'help', 'test', 'check', 'code', 'file',
+  'line', 'list', 'type', 'make', 'load', 'read', 'write', 'send',
+  'open', 'close', 'save', 'data', 'info', 'step', 'item', 'form',
+  'true', 'false', 'null', 'none', 'zero', 'able', 'want', 'seem',
+  'expected', 'actual', 'result', 'issue', 'problem', 'error', 'fail',
+  'note', 'case', 'page', 'part', 'side', 'left', 'right', 'start',
+  'end', 'done', 'like', 'also', 'however', 'therefore', 'example',
 ]);
